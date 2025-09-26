@@ -1,0 +1,11 @@
+[package]
+name = "mem_trace"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rWABIDB = { path = "../rWABIDB" }
+walrus = {version="0.23"}
+wasmtime = {version="37"}
+wasmtime-wasi = {version="37"}
+anyhow = {version="1.0"}
