@@ -1,6 +1,9 @@
-use std::{collections::{HashMap, HashSet}, env, fmt, hash::{Hash, Hasher}};
+mod trace_parser;
+use crate::trace_parser::{parse_trace, print_records};
+
+use std::{collections::{HashMap, HashSet}, env, hash::{Hash, Hasher}};
 use rWABIDB::instrumenter::{self, Instrumenter};
-use walrus::{ir::{dfs_in_order, dfs_pre_order_mut, BinaryOp, Call, Instr, InstrLocId, MemArg, Store, StoreKind, Value, Visitor, VisitorMut}, FunctionId, GlobalId, InstrSeqBuilder, Local, MemoryId, ValType};
+use walrus::{ir::{dfs_in_order, dfs_pre_order_mut, BinaryOp, Call, Const, ExtendedLoad, Instr, InstrLocId, Load, LoadKind, MemArg, Store, StoreKind, Value, Visitor, VisitorMut}, FunctionId, GlobalId, InstrSeqBuilder, Local, LocalId, MemoryId, ValType};
 use wasmtime::{Config, Engine, Linker};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::WasiCtxBuilder;
@@ -9,7 +12,7 @@ use anyhow::Result;
 struct MemTracer {
     trace_mem_id: MemoryId,
     trace_mem_pointer: GlobalId,
-    trace_mem_pointer_pre: GlobalId,
+    // trace_mem_pointer_pre: GlobalId,
 }
 
 #[derive(Debug, Clone)]
@@ -29,35 +32,55 @@ impl Hash for StoreInstanceKind {
     }
 }
 
-#[derive(Default)]
-struct StoreChecker {
-    store_kinds: HashSet<StoreInstanceKind>,
-}
+#[derive(Debug, Clone)]
+struct LoadInstanceKind(Load);
 
-impl<'instr> Visitor<'instr> for StoreChecker {
-    // fn visit_instr(&mut self, instr: &'instr Instr, _: &'instr InstrLocId) {
-    //     match instr {
-    //         Instr::Store(store) => { 
-    //             self.store_kinds.insert(StoreInstanceKind(store.clone()));
-    //         },
-    //         _ => { },
-    //     }
-    // }
-    fn visit_store(&mut self, instr: &Store) {
-        self.store_kinds.insert(StoreInstanceKind(instr.clone()));
+impl PartialEq for LoadInstanceKind {
+    fn eq(&self, other: &Self) -> bool {
+        format!("{:?}", self.0) == format!("{:?}", other.0)
     }
 }
 
-struct StoreHooker {
-    store_hooks_map: HashMap<StoreInstanceKind, FunctionId>,
+impl Eq for LoadInstanceKind {}
+
+impl Hash for LoadInstanceKind {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        format!("{:?}", self.0).hash(state);
+    }
 }
 
-impl VisitorMut for StoreHooker {
+#[derive(Default)]
+struct MemInstrChecker {
+    store_kinds: HashSet<StoreInstanceKind>,
+    load_kinds: HashSet<LoadInstanceKind>,
+}
+
+impl<'instr> Visitor<'instr> for MemInstrChecker {
+    fn visit_store(&mut self, instr: &Store) {
+        self.store_kinds.insert(StoreInstanceKind(instr.clone()));
+    }
+
+    fn visit_load(&mut self, instr: &Load) {
+        self.load_kinds.insert(LoadInstanceKind(instr.clone()));
+    }
+}
+
+struct MemInstrHooker {
+    store_hooks_map: HashMap<StoreInstanceKind, FunctionId>,
+    load_hooks_map: HashMap<LoadInstanceKind, FunctionId>,
+}
+
+impl VisitorMut for MemInstrHooker {
     fn visit_instr_mut(&mut self, instr: &mut Instr, _: &mut InstrLocId) {
         match instr {
             Instr::Store(store) => { 
                 *instr = Instr::Call(Call { 
                     func: *self.store_hooks_map.get(&StoreInstanceKind(store.clone())).unwrap() 
+                });
+            },
+            Instr::Load(load) => {
+                *instr = Instr::Call(Call { 
+                    func: *self.load_hooks_map.get(&LoadInstanceKind(load.clone())).unwrap()
                 });
             },
             _ => { },
@@ -79,35 +102,74 @@ fn main() {
         )
     ).unwrap();
 
+    // add aux memory and global for trace
     let trace_mem_id = instrumenter.add_memory(false, 1, None);
     instrumenter.add_export(TRACE_MEMORY_EXPORT_NAME, trace_mem_id);
     let trace_mem_pointer = instrumenter.add_global(ValType::I32, true, Value::I32(TRACE_START_ADDR as i32));
     instrumenter.add_export(TRACE_MEM_POINTER_EXPORT_NAME, trace_mem_pointer);
-    let trace_mem_pointer_pre = instrumenter.add_global(ValType::I32, true, Value::I32(TRACE_START_ADDR as i32));
+    // let trace_mem_pointer_pre = instrumenter.add_global(ValType::I32, true, Value::I32(TRACE_START_ADDR as i32));
     let mem_tracer = MemTracer {
         trace_mem_id,
         trace_mem_pointer,
-        trace_mem_pointer_pre,
+        // trace_mem_pointer_pre,
     };
 
-    let mut store_checker = StoreChecker::default();
+    // check and record types of store instructions
+    // TODO: check and record types of load instructions
+    let mut mem_instr_checker = MemInstrChecker::default();
     instrumenter
         .iter_defined_functions()
-        .for_each(|(_, f)| dfs_in_order(&mut store_checker, f, f.entry_block()));
+        .for_each(|(_, f)| dfs_in_order(&mut mem_instr_checker, f, f.entry_block()));
 
-    let mut store_hooker = StoreHooker {
-        store_hooks_map: add_store_hooks(&mut instrumenter, &store_checker.store_kinds, &mem_tracer) 
+    // add all hook functions for all types of store instructions used
+    let mut mem_instr_hooker = MemInstrHooker {
+        store_hooks_map: add_store_hooks(&mut instrumenter, &mem_instr_checker.store_kinds, &mem_tracer),
+        load_hooks_map: add_load_hooks(&mut instrumenter, &mem_instr_checker.load_kinds, &mem_tracer),
+    };
+    // TODO: add all hook functions for all types of load instructions used
+
+    // add instr_loc before every store and load instruction
+    let match_store_and_load: instrumenter::InstrMatcher = Box::new(|i: &Instr| {
+        matches!(
+            i,
+            Instr::Load(..) | 
+            Instr::Store(..)
+        )
+    });
+
+    let instrloc_modifier: instrumenter::FragmentModifier = Box::new(|(_, loc), pre, _| {
+        if let Instr::Const(Const {ref mut value}) = pre[0] {
+            if let Value::I32(ref mut n) = *value {
+                *n = loc.data() as i32;
+            }
+        }
+    });
+
+    let op = instrumenter::InstrumentOperation {
+        targets: match_store_and_load,
+        pre_instructions: vec![
+            Instr::Const(Const{value: Value::I32(0xFFFF_FFFFu32 as i32)}),
+        ],
+        post_instructions: vec![],
+        modifier: Some(instrloc_modifier),
     };
 
+    instrumenter.instrument(&vec![op]);
+
+    // modify all store instructions to their related hook functions
+    // TODO: modify all load instructions to their related hook functions
     instrumenter.for_scope_functions_mut(
-        |_, f| dfs_pre_order_mut(&mut store_hooker, f, f.entry_block())
+        |_, f| dfs_pre_order_mut(&mut mem_instr_hooker, f, f.entry_block())
     );
 
+    // write the instrumented wasm to file
     instrumenter.write_binary().unwrap();
 
+    // try execute the instrumented wasm with wasmtime to get raw trace in binary format
     let wasm_binary = instrumenter.get_binary();
-
     let raw_trace = run_wasm_and_trace(&wasm_binary).expect("failed to run instrumented wasm and get trace");
+    
+    // parse the raw trace
     let records = match parse_trace(&raw_trace) {
         Ok(records) => records,
         Err(e) => {
@@ -116,206 +178,6 @@ fn main() {
         }
     };
     print_records(&records);
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum RecordValue {
-    I32(i32),
-    I64(i64),
-    F32(f32),
-    F64(f64),
-    V128([u8; 16]),
-}
-
-impl fmt::Display for RecordValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RecordValue::I32(v) => write!(f, "I32({})", v),
-            RecordValue::I64(v) => write!(f, "I64({})", v),
-            RecordValue::F32(v) => write!(f, "F32({})", v),
-            RecordValue::F64(v) => write!(f, "F64({})", v),
-            RecordValue::V128(bytes) => {
-                write!(f, "V128(")?;
-                for (i, b) in bytes.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "0x{:02X}", b)?;
-                }
-                write!(f, ")")
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TraceRecordStore {
-    pub code: u32,
-    pub addr: u32,
-    pub value: RecordValue,
-    pub offset: u32,
-}
-
-pub enum TraceRecord {
-    StoreRecord(TraceRecordStore),
-}
-
-impl fmt::Display for TraceRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TraceRecord::StoreRecord(r) => write!(
-                f,
-                "StoreRecord {{ code: 0x{:02X}, addr: {}, value: {}, offset: {} }}",
-                r.code, r.addr, r.value, r.offset
-            ),
-        }
-    }
-}
-
-pub fn print_records(records: &Vec<TraceRecord>) {
-    let max_index = if records.is_empty() { 0 } else { records.len() - 1 };
-    let width = std::cmp::max(1, max_index.to_string().len());
-
-    for (i, record) in records.iter().enumerate() {
-        println!("[{:>width$}] {}", i, record, width = width);
-    }
-}
-
-#[derive(Debug)]
-pub enum TraceParseError {
-    UnexpectedEof { needed: usize, remaining: usize },
-    InvalidData(String),
-    TrailingBytes(usize),
-}
-
-impl std::error::Error for TraceParseError {}
-impl fmt::Display for TraceParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TraceParseError::UnexpectedEof { needed, remaining } => {
-                write!(f, "unexpected EOF: need {} bytes but only {} remaining", needed, remaining)
-            }
-            TraceParseError::InvalidData(s) => write!(f, "invalid data: {}", s),
-            TraceParseError::TrailingBytes(n) => write!(f, "trailing {} unread bytes after parsing", n),
-        }
-    }
-}
-
-struct BufferReader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> BufferReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    /// try read n bytes and move pos
-    fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], TraceParseError> {
-        if self.pos + n <= self.buf.len() {
-            let s = &self.buf[self.pos..self.pos + n];
-            self.pos += n;
-            Ok(s)
-        } else {
-            Err(TraceParseError::UnexpectedEof {
-                needed: n,
-                remaining: self.buf.len().saturating_sub(self.pos),
-            })
-        }
-    }
-
-    fn remaining(&self) -> usize {
-        self.buf.len().saturating_sub(self.pos)
-    }
-
-    fn read_u32(&mut self) -> Result<u32, TraceParseError> {
-        let s = self.read_bytes(4)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn read_i32(&mut self) -> Result<i32, TraceParseError> {
-        let s = self.read_bytes(4)?;
-        Ok(i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn read_i64(&mut self) -> Result<i64, TraceParseError> {
-        let s = self.read_bytes(8)?;
-        Ok(i64::from_le_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
-    }
-
-    fn read_f32(&mut self) -> Result<f32, TraceParseError> {
-        let s = self.read_bytes(4)?;
-        Ok(f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn read_f64(&mut self) -> Result<f64, TraceParseError> {
-        let s = self.read_bytes(8)?;
-        Ok(f64::from_le_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
-    }
-
-    fn read_v128(&mut self) -> Result<[u8; 16], TraceParseError> {
-        let s = self.read_bytes(16)?;
-        let mut a = [0u8; 16];
-        a.copy_from_slice(s);
-        Ok(a)
-    }
-}
-
-fn parse_trace(raw_trace: &Vec<u8>) -> Result<Vec<TraceRecord>, TraceParseError> {
-    let buf: &[u8] = raw_trace.as_slice();
-    let mut reader = BufferReader::new(buf);
-    let mut out: Vec<TraceRecord> = Vec::new();
-
-    while reader.remaining() > 0 {
-        let code = reader.read_u32()?;
-        let addr = reader.read_u32()?;
-
-        let value = match code {
-            0x36 | 0x3A | 0x3B => {
-                // i32 payload
-                let v = reader.read_i32()?;
-                RecordValue::I32(v)
-            }
-            0x37 | 0x3C | 0x3D | 0x3E => {
-                // i64 payload
-                let v = reader.read_i64()?;
-                RecordValue::I64(v)
-            }
-            0x38 => {
-                // f32 payload
-                let v = reader.read_f32()?;
-                RecordValue::F32(v)
-            }
-            0x39 => {
-                // f64 payload
-                let v = reader.read_f64()?;
-                RecordValue::F64(v)
-            }
-            0xFD => {
-                // v128 payload (16 bytes)
-                let v = reader.read_v128()?;
-                RecordValue::V128(v)
-            }
-            _ => {return Err(TraceParseError::InvalidData("Code mistached".to_string()));},
-        };
-
-        let offset = reader.read_u32()?;
-
-        out.push(TraceRecord::StoreRecord(
-            TraceRecordStore {
-                code,
-                addr,
-                value,
-                offset,
-            })
-        );
-    }
-    Ok(out)
 }
 
 fn run_wasm_and_trace(wasm_binary: &Vec<u8>) -> Result<Vec<u8>> {
@@ -367,28 +229,28 @@ fn add_store_hooks(instrumenter: &mut Instrumenter, store_kinds: &HashSet<StoreI
             StoreKind::I64 { .. } => (0x37, ValType::I64),
             StoreKind::F32 => (0x38, ValType::F32),
             StoreKind::F64 => (0x39, ValType::F64),
-            StoreKind::V128 => (0xFD, ValType::V128),
+            StoreKind::V128 => todo!(),
             StoreKind::I32_8 { .. } => (0x3A, ValType::I32),
             StoreKind::I32_16 { .. } => (0x3B, ValType::I32),
             StoreKind::I64_8 { .. } => (0x3C, ValType::I64),
             StoreKind::I64_16 { .. } => (0x3D, ValType::I64),
             StoreKind::I64_32 { .. } => (0x3E, ValType::I64),
         };
-        // here is (addr: i32, value: any)
-        // TODO: add instr_loc_id
-        let args = &[ValType::I32, i_args];
+        // here is (addr: i32, value: any, instr_loc: i32)
+        let args = &[ValType::I32, i_args, ValType::I32];
         let func_id = instrumenter.add_function(Some(name), args, &[], &[], 
             |builder, locals| {
                 let offset: &mut u32 = &mut 0;
-                // record current mem_pointer
-                builder
-                    .global_get(mem_tracer.trace_mem_pointer)
-                    .global_set(mem_tracer.trace_mem_pointer_pre);
+                // record current mem_pointer, used for write trace to file in wasm
+                // builder
+                //     .global_get(mem_tracer.trace_mem_pointer)
+                //     .global_set(mem_tracer.trace_mem_pointer_pre);
                 
                 // trace code of the hooked instr
                 mem_tracer.trace_u32(builder, opcode, offset);
                 
-                // trace params of the hooked instr
+                // trace params of the hooked instr, and the instr_loc followed
+                // in the order of [addr, value, instr_loc]
                 mem_tracer.trace_params(builder, locals, offset);
 
                 // trace offset of the store instr
@@ -405,6 +267,66 @@ fn add_store_hooks(instrumenter: &mut Instrumenter, store_kinds: &HashSet<StoreI
                     .local_get(locals[0].id())
                     .local_get(locals[1].id())
                     .instr(kind.0.clone());
+            }
+        );
+        ret.insert(kind.clone(), func_id);
+    }
+    ret
+}
+
+fn add_load_hooks(instrumenter: &mut Instrumenter, load_kinds: &HashSet<LoadInstanceKind>, mem_tracer: &MemTracer) -> HashMap<LoadInstanceKind, FunctionId> {
+    let mut ret: HashMap<LoadInstanceKind, FunctionId> = HashMap::new();
+    fn extend_helper(kind: &ExtendedLoad) -> u32 {
+        match kind {
+            ExtendedLoad::SignExtend => 0,
+            ExtendedLoad::ZeroExtend | ExtendedLoad::ZeroExtendAtomic => 1,
+        }
+    }
+    for kind in load_kinds {
+        let name = format!("_hook_{:?}", kind.0);
+        let (opcode, i_args) = match kind.0.kind {
+            LoadKind::I32 { .. } => (0x28, ValType::I32),
+            LoadKind::I64 { .. } => (0x29, ValType::I64),
+            LoadKind::F32 => (0x2A, ValType::F32),
+            LoadKind::F64 => (0x2B, ValType::F64),
+            LoadKind::V128 => todo!(),
+            LoadKind::I32_8 { kind } => (0x2C + extend_helper(&kind), ValType::I32),
+            LoadKind::I32_16 { kind } => (0x2E + extend_helper(&kind), ValType::I32),
+            LoadKind::I64_8 { kind } => (0x30 + extend_helper(&kind), ValType::I64),
+            LoadKind::I64_16 { kind } => (0x32 + extend_helper(&kind), ValType::I64),
+            LoadKind::I64_32 { kind } => (0x34 + extend_helper(&kind), ValType::I64),
+        };
+        // here is (addr: i32, instr_loc: i32)
+        let args = &[ValType::I32, ValType::I32];
+        let func_id = instrumenter.add_function(Some(name), args, &[i_args], &[i_args], 
+            |builder, locals| {
+                let offset: &mut u32 = &mut 0;
+                // record current mem_pointer, used for write trace to file in wasm
+                // builder
+                //     .global_get(mem_tracer.trace_mem_pointer)
+                //     .global_set(mem_tracer.trace_mem_pointer_pre);
+                
+                // trace code of the hooked instr
+                mem_tracer.trace_u32(builder, opcode, offset);
+                
+                // do the hooked instr
+                builder
+                    .local_get(locals[0].id())
+                    .instr(kind.0.clone())
+                    .local_tee(locals[2].id());
+
+                // trace params of the hooked instr, and the instr_loc followed
+                // in the order of [addr, value, instr_loc]
+                mem_tracer.trace_params(builder, &[locals[0], locals[2], locals[1]], offset);
+
+                // trace offset of the load instr
+                mem_tracer.trace_u32(builder, kind.0.arg.offset, offset);
+                
+                // increment mem_pointer
+                mem_tracer.increment_mem_pointer(builder, *offset);
+                
+                // write trace_memory[trace_mem_pointer_pre, trace_mem_pointer] to file
+                // TODO:
             }
         );
         ret.insert(kind.clone(), func_id);
@@ -446,14 +368,9 @@ impl MemTracer {
         align
     }
 
-    // only api prefix is trace should be used outside
     fn trace_params(&self, seq: &mut InstrSeqBuilder, params: &[&Local], offset: &mut u32) {
         for l in params.into_iter() {
-            seq
-                .global_get(self.trace_mem_pointer)
-                .local_get(l.id());
-            let amount = self.store_val_type(seq, l.ty(), *offset);
-            *offset += amount;
+            self.trace_local(seq, l.id(), l.ty(), offset);
         }
     }
 
@@ -465,4 +382,11 @@ impl MemTracer {
         *offset += 4;
     }
 
+    fn trace_local(&self, seq: &mut InstrSeqBuilder, id: LocalId, val_type: ValType, offset: &mut u32) {
+        seq
+            .global_get(self.trace_mem_pointer)
+            .local_get(id);
+        let amount = self.store_val_type(seq, val_type, *offset);
+        *offset += amount;
+    }
 }
