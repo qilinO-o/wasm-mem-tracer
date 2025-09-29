@@ -1,5 +1,7 @@
 mod trace_parser;
+mod trace_analyzer;
 use crate::trace_parser::{parse_trace, print_records};
+use crate::trace_analyzer::analysis_trace;
 
 use std::{collections::{HashMap, HashSet}, env, hash::{Hash, Hasher}};
 use rWABIDB::instrumenter::{self, Instrumenter};
@@ -178,6 +180,9 @@ fn main() {
         }
     };
     print_records(&records);
+
+    let defects = analysis_trace(&records);
+    println!("{:?}", defects);
 }
 
 fn run_wasm_and_trace(wasm_binary: &Vec<u8>) -> Result<Vec<u8>> {
