@@ -9,3 +9,4 @@ walrus = {version="0.23"}
 wasmtime = {version="37"}
 wasmtime-wasi = {version="37"}
 anyhow = {version="1.0"}
+clap = {version="4.5", features = ["derive"]}

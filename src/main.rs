@@ -5,30 +5,85 @@ use crate::trace_parser::{parse_trace, print_records};
 use crate::trace_analyzer::analysis_trace;
 use crate::mem_tracer::{add_load_hooks, add_store_hooks, MemInstrChecker, MemInstrHooker, MemTracer};
 
-use std::env;
+use std::path::{Path, PathBuf};
 use rWABIDB::instrumenter::{self, Instrumenter};
 use walrus::{ir::{dfs_in_order, dfs_pre_order_mut, Const, Instr, Value}, ValType};
 use wasmtime::{Config, Engine, Linker};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::WasiCtxBuilder;
 use anyhow::Result;
+use clap::Parser;
 
 const TRACE_START_ADDR: usize = 0;
 const TRACE_MEMORY_EXPORT_NAME: &str = "_trace_memory";
 const TRACE_MEM_POINTER_EXPORT_NAME: &str = "_trace_mem_pointer";
 
+#[derive(Debug, Parser)]
+#[command(name = "mem-tracer", version = "0.1", about = "Trace wasm linear memory usage")]
+struct Cli {
+    #[arg(value_parser = parse_wasm_path)]
+    input: PathBuf,
+
+    // optional output file name, or by default 'xxx_instrumented.wasm'
+    #[arg(short = 'o', long = "out")]
+    out: Option<PathBuf>,
+
+    // a sign -r, indicating whether to run the instrumented wasm
+    #[arg(short = 'r', long = "run")]
+    r_flag: bool,
+
+    // a sign -f, indicating whether to print the full trace
+    #[arg(short = 'f', long = "full")]
+    f_flag: bool,
+
+    // colletc all trailing args after --
+    #[arg(last = true)]
+    rest: Vec<String>,
+}
+
+fn parse_wasm_path(s: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(s);
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("wasm") => Ok(p),
+        _ => Err(format!("input file must be end with '.wasm', getting: {}", s)),
+    }
+}
+
+fn default_output_for(input: &Path) -> PathBuf {
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let mut out_name = String::with_capacity(stem.len() + 20);
+    out_name.push_str(stem);
+    out_name.push_str("_instrumented.wasm");
+    if let Some(parent) = input.parent() {
+        parent.join(out_name)
+    } else {
+        PathBuf::from(out_name)
+    }
+}
+
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let file_name_prefix = &args[1];
+    // cli logics
+    let cli = Cli::parse();
+    let input_path = cli.input.clone();
+    let out_path = match &cli.out {
+        Some(p) => p.clone(),
+        None => default_output_for(&cli.input),
+    };
+
+    let mut wasm_args: Vec<String> = Vec::new();
+    for a in &cli.rest {
+        wasm_args.push(String::from(a));
+    }
+
     let mut instrumenter = Instrumenter::from_config(
         instrumenter::InstrumentConfig::new(
-            format!("./playground/{}.wasm", file_name_prefix),
-            format!("./playground/{}_instrumented.wasm", file_name_prefix),
+            input_path,
+            out_path,
         )
     ).unwrap();
 
     // add aux memory and global for trace
-    let trace_mem_id = instrumenter.add_memory(false, 1, None);
+    let trace_mem_id = instrumenter.add_memory(false, 30000, None);
     instrumenter.add_export(TRACE_MEMORY_EXPORT_NAME, trace_mem_id);
     let trace_mem_pointer = instrumenter.add_global(ValType::I32, true, Value::I32(TRACE_START_ADDR as i32));
     instrumenter.add_export(TRACE_MEM_POINTER_EXPORT_NAME, trace_mem_pointer);
@@ -90,9 +145,12 @@ fn main() {
     // write the instrumented wasm to file
     instrumenter.write_binary().unwrap();
 
+    if !cli.r_flag {
+        return;
+    }
     // try execute the instrumented wasm with wasmtime to get raw trace in binary format
     let wasm_binary = instrumenter.get_binary();
-    let raw_trace = run_wasm_and_trace(&wasm_binary).expect("failed to run instrumented wasm and get trace");
+    let raw_trace = run_wasm_and_trace(&wasm_binary, &wasm_args).expect("failed to run instrumented wasm and get trace");
     
     // parse the raw trace
     let records = match parse_trace(&raw_trace) {
@@ -102,13 +160,16 @@ fn main() {
             return;
         }
     };
-    print_records(&records);
+
+    if cli.f_flag {
+        print_records(&records);
+    }
 
     let defects = analysis_trace(&records);
     println!("{:?}", defects);
 }
 
-fn run_wasm_and_trace(wasm_binary: &Vec<u8>) -> Result<Vec<u8>> {
+fn run_wasm_and_trace(wasm_binary: &Vec<u8>, wasm_args: &Vec<String>) -> Result<Vec<u8>> {
     let mut config = Config::new();
     config.wasm_multi_memory(true);
     let engine = Engine::new(&config)?;
@@ -120,6 +181,7 @@ fn run_wasm_and_trace(wasm_binary: &Vec<u8>) -> Result<Vec<u8>> {
     let wasi_ctx = WasiCtxBuilder::new()
         .inherit_stdio()
         .inherit_env()
+        .args(wasm_args)
         .build_p1();
 
     let mut store = wasmtime::Store::new(&engine, wasi_ctx);
