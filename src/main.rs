@@ -2,7 +2,7 @@ mod trace_parser;
 mod trace_analyzer;
 mod mem_tracer;
 use crate::trace_parser::{parse_trace, print_records};
-use crate::trace_analyzer::analysis_trace;
+use crate::trace_analyzer::{analysis_trace, deduplicate_defects};
 use crate::mem_tracer::{add_load_hooks, add_store_hooks, MemInstrChecker, MemInstrHooker, MemTracer};
 
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use wasmtime::{Config, Engine, Linker};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::WasiCtxBuilder;
 use anyhow::Result;
-use clap::Parser;
+use clap::{ArgAction, Parser};
 
 const TRACE_START_ADDR: usize = 0;
 const TRACE_MEMORY_EXPORT_NAME: &str = "_trace_memory";
@@ -21,23 +21,28 @@ const TRACE_MEM_POINTER_EXPORT_NAME: &str = "_trace_mem_pointer";
 #[derive(Debug, Parser)]
 #[command(name = "mem-tracer", version = "0.1", about = "Trace wasm linear memory usage")]
 struct Cli {
-    #[arg(value_parser = parse_wasm_path)]
+    #[arg(value_parser = parse_wasm_path, help = "Input .wasm file (must end with .wasm)")]
     input: PathBuf,
 
     // optional output file name, or by default 'xxx_instrumented.wasm'
-    #[arg(short = 'o', long = "out")]
+    #[arg(short = 'o', long = "out", help = "Set the output file name (default: <input>_instrumented.wasm)")]
     out: Option<PathBuf>,
 
     // a sign -r, indicating whether to run the instrumented wasm
-    #[arg(short = 'r', long = "run")]
+    #[arg(short = 'r', long = "run", help = "Sign indicating whether to run the instrumented wasm")]
     r_flag: bool,
 
-    // a sign -f, indicating whether to print the full trace
-    #[arg(short = 'f', long = "full")]
-    f_flag: bool,
+    // a count sign -f(-ff, -fff), indicating whether to print the full trace
+    #[arg(short = 'f', action = ArgAction::Count, help = r#"Set full level (-f, -ff, -fff)
+Level details:
+  - `-f`   : Deduplicated memory defects hashed by wasm binary addr
+  - `-ff`  : All memory defects records by index
+  - `-fff` : Full memory access trace
+Higher levels include all lower ones."#)]
+    f_flag: u8,
 
     // colletc all trailing args after --
-    #[arg(last = true)]
+    #[arg(last = true, help = "Arguments passed after '--' will be forwarded to the wasmtime engine")]
     rest: Vec<String>,
 }
 
@@ -161,12 +166,21 @@ fn main() {
         }
     };
 
-    if cli.f_flag {
+    if cli.f_flag >= 3 {
         print_records(&records);
     }
 
     let defects = analysis_trace(&records);
-    println!("{:?}", defects);
+
+    if cli.f_flag >= 2 {
+        println!("{}", defects);
+    }
+
+    let dedup_defects = deduplicate_defects(&records, &defects);
+    
+    if cli.f_flag >= 1 {
+        println!("{}", dedup_defects);
+    }
 }
 
 fn run_wasm_and_trace(wasm_binary: &Vec<u8>, wasm_args: &Vec<String>) -> Result<Vec<u8>> {

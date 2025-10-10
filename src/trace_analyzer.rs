@@ -1,11 +1,55 @@
 use crate::trace_parser::{TraceRecord, RecordValue};
-use std::collections::HashMap;
+use std::{collections::{HashMap, HashSet}, fmt};
 
 #[derive(Debug, Default)]
 pub struct DefectResults {
     pub dead_store_pairs: Vec<(usize, usize)>,
     pub silent_store_pairs: Vec<(usize, usize)>,
     pub silent_load_pairs: Vec<(usize, usize)>,
+}
+
+pub struct DedupDefects {
+    pub dead_store_pairs: HashSet<(u32, u32)>,
+    pub silent_store_pairs: HashSet<(u32, u32)>,
+    pub silent_load_pairs: HashSet<(u32, u32)>,
+}
+
+impl fmt::Display for DefectResults {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "DefectResults (by index) {{")?;
+        writeln!(f, "  dead_store_pairs ({} entries):", self.dead_store_pairs.len())?;
+        for (a, b) in &self.dead_store_pairs {
+            writeln!(f, "    ({}, {})", a, b)?;
+        }
+        writeln!(f, "  silent_store_pairs ({} entries):", self.silent_store_pairs.len())?;
+        for (a, b) in &self.silent_store_pairs {
+            writeln!(f, "    ({}, {})", a, b)?;
+        }
+        writeln!(f, "  silent_load_pairs ({} entries):", self.silent_load_pairs.len())?;
+        for (a, b) in &self.silent_load_pairs {
+            writeln!(f, "    ({}, {})", a, b)?;
+        }
+        write!(f, "}}")
+    }
+}
+
+impl fmt::Display for DedupDefects {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "DedupDefects (by wasm binary addr) {{")?;
+        writeln!(f, "  dead_store_pairs ({} entries):", self.dead_store_pairs.len())?;
+        for (a, b) in &self.dead_store_pairs {
+            writeln!(f, "    ({:X}, {:X})", a, b)?;
+        }
+        writeln!(f, "  silent_store_pairs ({} entries):", self.silent_store_pairs.len())?;
+        for (a, b) in &self.silent_store_pairs {
+            writeln!(f, "    ({:X}, {:X})", a, b)?;
+        }
+        writeln!(f, "  silent_load_pairs ({} entries):", self.silent_load_pairs.len())?;
+        for (a, b) in &self.silent_load_pairs {
+            writeln!(f, "    ({:X}, {:X})", a, b)?;
+        }
+        write!(f, "}}")
+    }
 }
 
 /// record the recent store info for an addr
@@ -95,4 +139,48 @@ pub fn analysis_trace(trace: &[TraceRecord]) -> DefectResults {
     }
 
     results
+}
+
+pub fn deduplicate_defects(trace: &[TraceRecord], defects: &DefectResults) -> DedupDefects {
+    let mut out = DedupDefects {
+        dead_store_pairs: HashSet::new(),
+        silent_store_pairs: HashSet::new(),
+        silent_load_pairs: HashSet::new(),
+    };
+    // Helper to safely get store loc at index
+    let get_store_loc = |idx: usize| -> Option<u32> {
+        trace.get(idx).and_then(|rec| match rec {
+            TraceRecord::StoreRecord(s) => Some(s.loc),
+            _ => None,
+        })
+    };
+    // Helper to safely get load loc at index
+    let get_load_loc = |idx: usize| -> Option<u32> {
+        trace.get(idx).and_then(|rec| match rec {
+            TraceRecord::LoadRecord(l) => Some(l.loc),
+            _ => None,
+        })
+    };
+    // dead_store_pairs: expect store records
+    for &(i, j) in &defects.dead_store_pairs {
+        let (i_usize, j_usize) = (i as usize, j as usize);
+        if let (Some(loc_i), Some(loc_j)) = (get_store_loc(i_usize), get_store_loc(j_usize)) {
+            out.dead_store_pairs.insert((loc_i, loc_j));
+        }
+    }
+    // silent_store_pairs: expect store records
+    for &(i, j) in &defects.silent_store_pairs {
+        let (i_usize, j_usize) = (i as usize, j as usize);
+        if let (Some(loc_i), Some(loc_j)) = (get_store_loc(i_usize), get_store_loc(j_usize)) {
+            out.silent_store_pairs.insert((loc_i, loc_j));
+        }
+    }
+    // silent_load_pairs: expect load records
+    for &(i, j) in &defects.silent_load_pairs {
+        let (i_usize, j_usize) = (i as usize, j as usize);
+        if let (Some(loc_i), Some(loc_j)) = (get_load_loc(i_usize), get_load_loc(j_usize)) {
+            out.silent_load_pairs.insert((loc_i, loc_j));
+        }
+    }
+    out
 }
