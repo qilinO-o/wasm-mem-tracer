@@ -147,7 +147,7 @@ The instrumentation adds:
 
 ## Dependencies
 
-- `rWABIDB`: WebAssembly binary instrumentation framework
+- `rWABIDB`: My WebAssembly binary instrumentation framework @[https://github.com/qilinO-o/rWABIDB]
 - `walrus`: WebAssembly parser and manipulation library
 - `wasmtime`: WebAssembly runtime for execution
 - `wasmtime-wasi`: WASI support for wasmtime
